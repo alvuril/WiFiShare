@@ -457,8 +457,23 @@ def gui():
     ACC, ACC_HOVER, BTN, BTN_HOVER, GREEN = "#3b7bf6", "#5a92ff", "#262c36", "#323a47", "#3ddc84"
     FONT = "Segoe UI"
 
-    default_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), "Downloads", "WiFiShare"))
-    cfg_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "WiFiShare")
+    def can_write(path):
+        try:
+            with tempfile.TemporaryFile(dir=path):
+                return True
+        except OSError:
+            return False
+
+    # Everything lives in the app's own folder: the program, its settings and the Received folder.
+    # If that folder isn't writable (e.g. Program Files), fall back to the user's folders.
+    app_dir = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    portable = can_write(app_dir)
+    if portable:
+        default_dir = os.path.normpath(os.path.join(app_dir, "Received"))
+        cfg_dir = app_dir
+    else:
+        default_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), "Downloads", "WiFiShare Received"))
+        cfg_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "WiFiShare")
     cfg_path = os.path.join(cfg_dir, "config.json")
 
     def save_cfg(data):
@@ -474,7 +489,7 @@ def gui():
             saved = json.load(f).get("folder")
     except (OSError, ValueError, AttributeError):
         saved = None
-    folder = os.path.normpath(saved) if saved and os.path.isdir(saved) else default_dir
+    folder = os.path.normpath(saved) if saved and os.path.isdir(saved) and can_write(saved) else default_dir
     srv = url = None
     for port in range(8000, 8011):
         try:
@@ -582,7 +597,7 @@ def gui():
         path = os.path.normpath(path)
         try:
             os.makedirs(path, exist_ok=True)
-            if not os.access(path, os.W_OK):
+            if not can_write(path):
                 raise OSError("not writable")
         except OSError:
             messagebox.showerror("WiFi Share", f"Can't save files to:\n{path}\n\nPick another folder.")
