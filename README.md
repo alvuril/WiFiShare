@@ -3,10 +3,10 @@
 Send any file between two devices on the same Wi-Fi. No accounts, no cloud, no dependencies, just Python 3.8+.
 
 ## How it works
-Run it on one device. It prints a URL. Open that URL on the other device (a phone browser works too) and drop files in. Files appear in the `received` folder and also show up in the page, so the other device can download them. Run it on both devices to send in both directions.
+Run it on one device. It shows a QR code and a URL. Scan or open that on the other device (a phone browser works) and send files. Files appear in the `received` folder and also show up in the page, so the other device can download them. Run it on both devices to send in both directions.
 
 ## Download (Windows)
-Grab `WiFiShare.exe` from the [Releases](../../releases) page (built automatically by GitHub Actions) and double-click it. A small window shows a link; open it on your other device. Windows will ask about the firewall the first time: click Allow on private networks.
+Grab `WiFiShare.exe` from the [Releases](../../releases) page (built automatically by GitHub Actions) and double-click it. A window shows a QR code and a link. On your phone, point the camera at the QR code and tap the banner that appears (iPhone and Android both work), or type the link by hand. Received files are listed live in the window and saved to `Downloads\WiFiShare`. Windows will ask about the firewall the first time: click Allow on private networks.
 
 ## Usage from Python
 ```
