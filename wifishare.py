@@ -14,8 +14,11 @@ import json
 import os
 import secrets
 import socket
+import shutil
 import socketserver
 import sys
+import tempfile
+import threading
 import urllib.parse
 import urllib.request
 
@@ -44,15 +47,20 @@ h1{font-size:1.4rem}h2{font-size:1rem;margin-top:28px}
 progress{width:90px}a{color:var(--acc)}
 </style></head><body><main>
 <h1>WiFi Share</h1>
-<div id="drop">Tap or drop files here to send them to this device
+<div id="drop"><span id="droptxt">Tap or drop files here to send</span>
 <input id="pick" type="file" multiple hidden></div>
 <div id="up"></div>
-<h2>Files on this device</h2>
+<h2 id="listh"></h2>
 <div id="list"></div>
 <script>
 const KEY=new URLSearchParams(location.search).get('key')||'';
 const q=KEY?'?key='+encodeURIComponent(KEY):'';
 const $=id=>document.getElementById(id);
+const TXT={
+ remote:{drop:'Tap or drop files here to send them to the computer',head:'Shared by the computer',none:'Nothing shared yet.',done:'sent'},
+ host:{drop:'Tap or drop files here to send them to the other device',head:'Received from the other device',none:'Nothing received yet.',done:'ready on the other device'}};
+let ROLE='remote';
+function texts(){const t=TXT[ROLE];$('droptxt').textContent=t.drop;$('listh').textContent=t.head}
 const size=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
 function el(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e}
 function send(file){
@@ -63,7 +71,7 @@ function send(file){
     const x=new XMLHttpRequest();
     x.open('POST','/upload?name='+encodeURIComponent(file.name)+(KEY?'&key='+encodeURIComponent(KEY):''));
     x.upload.onprogress=e=>{if(e.lengthComputable)bar.value=e.loaded/e.total};
-    x.onloadend=()=>{const ok=x.status===200;bar.remove();st.textContent=ok?'sent':'failed';done()};
+    x.onloadend=()=>{const ok=x.status===200;bar.remove();st.textContent=ok?TXT[ROLE].done:'failed';done()};
     x.send(file);
   });
 }
@@ -71,9 +79,10 @@ async function sendAll(files){for(const f of files)await send(f);load()}
 async function load(){
   try{
     const r=await fetch('/api/files'+q);if(!r.ok)return;
-    const files=await r.json(),box=$('list');box.replaceChildren();
-    if(!files.length){box.append(el('small','Nothing received yet.'))}
-    for(const f of files){
+    const d=await r.json();ROLE=d.role;texts();
+    const box=$('list');box.replaceChildren();
+    if(!d.files.length){box.append(el('small',TXT[ROLE].none))}
+    for(const f of d.files){
       const row=el('div');row.className='row';
       const a=el('a',f.name);a.href='/download/'+encodeURIComponent(f.name)+q;
       row.append(a,el('small',size(f.size)));box.append(row);
@@ -86,7 +95,7 @@ pick.onchange=()=>{sendAll([...pick.files]);pick.value=''};
 drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
 drop.ondragleave=()=>drop.classList.remove('over');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');sendAll([...e.dataTransfer.files])};
-load();setInterval(load,3000);
+texts();load();setInterval(load,3000);
 </script></main></body></html>"""
 
 
@@ -117,7 +126,36 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def share(srv, path, name=None):
+    """Offer a file to the other device. Nothing is copied or saved on this computer."""
+    name = os.path.basename((name or path).replace("\\", "/")) or "file"
+    base, ext = os.path.splitext(name)
+    key, n = name, 1
+    with srv.lock:
+        while key in srv.outbox:
+            key = f"{base} ({n}){ext}"
+            n += 1
+        srv.outbox[key] = path
+    return key
+
+
+def unshare(srv, name):
+    path = srv.outbox.pop(name, None)
+    if path and os.path.dirname(path) == srv.staging:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def cleanup(srv):
+    shutil.rmtree(srv.staging, ignore_errors=True)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    """Files sent BY the other device are saved on this computer (srv.folder).
+    Files sent FROM this computer are only offered to the other device (srv.outbox)."""
+
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -141,36 +179,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         given = query.get("key", [self.headers.get("X-Key", "")])[0]
         return secrets.compare_digest(given.encode(), key.encode())
 
+    def _is_host(self):
+        """True when the request comes from the computer running the app itself."""
+        return self.client_address[0] in self.server.host_ips
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
         if not self._authorized(query):
             return self._reply(403, b"Missing or wrong key. Use the full URL shown in the terminal.")
-        folder = self.server.folder
+        srv, host = self.server, self._is_host()
         if url.path == "/":
             return self._reply(200, PAGE, "text/html; charset=utf-8")
         if url.path == "/api/files":
+            if host:  # this computer sees what the other device sent to it
+                entries = [(n, os.path.join(srv.folder, n)) for n in os.listdir(srv.folder)
+                           if not n.endswith(".part")]
+            else:  # the other device sees what this computer is sharing
+                entries = list(srv.outbox.items())
             items = []
-            for n in os.listdir(folder):
-                p = os.path.join(folder, n)
-                if os.path.isfile(p) and not n.endswith(".part"):
-                    st = os.stat(p)
-                    items.append({"name": n, "size": st.st_size, "mtime": st.st_mtime})
+            for name, path in entries:
+                if os.path.isfile(path):
+                    st = os.stat(path)
+                    items.append({"name": name, "size": st.st_size, "mtime": st.st_mtime})
             items.sort(key=lambda i: -i["mtime"])
-            return self._reply(200, json.dumps(items).encode(), "application/json")
+            body = json.dumps({"role": "host" if host else "remote", "files": items})
+            return self._reply(200, body.encode(), "application/json")
         if url.path.startswith("/download/"):
             name = os.path.basename(urllib.parse.unquote(url.path[len("/download/"):]))
-            path = os.path.join(folder, name)
-            if not name or not os.path.isfile(path):
+            path = os.path.join(srv.folder, name) if host else srv.outbox.get(name)
+            if not name or not path or not os.path.isfile(path):
                 return self._reply(404, b"Not found")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(os.path.getsize(path)))
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
             self.end_headers()
-            with open(path, "rb") as f:
-                while chunk := f.read(CHUNK):
-                    self.wfile.write(chunk)
+            try:
+                with open(path, "rb") as f:
+                    while chunk := f.read(CHUNK):
+                        self.wfile.write(chunk)
+            except OSError:
+                return
+            if not host and srv.on_download:
+                srv.on_download(name)
             return
         self._reply(404, b"Not found")
 
@@ -185,7 +237,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers["Content-Length"])
         except (TypeError, ValueError):
             return self._reply(411, b"Content-Length required", close=True)
-        path = unique_path(self.server.folder, query.get("name", ["file"])[0])
+        srv, host = self.server, self._is_host()
+        orig = query.get("name", ["file"])[0]
+        # from the other device -> saved here; from this computer -> staged for the other device only
+        path = unique_path(srv.staging if host else srv.folder, orig)
         part, left = path + ".part", length
         try:
             with open(part, "wb") as f:
@@ -200,10 +255,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if os.path.exists(part):
                 os.remove(part)
             return self._reply(500, b"Upload failed", close=True)
-        print(f"  received  {os.path.basename(path)}  ({length:,} bytes)")
-        if self.server.on_receive:
-            self.server.on_receive(os.path.basename(path), length)
-        self._reply(200, json.dumps({"saved": os.path.basename(path)}).encode(), "application/json")
+        if host:
+            saved = share(srv, path, orig)
+        else:
+            saved = os.path.basename(path)
+            print(f"  received  {saved}  ({length:,} bytes)")
+            if srv.on_receive:
+                srv.on_receive(saved, length)
+        self._reply(200, json.dumps({"saved": saved}).encode(), "application/json")
 
 
 def start_server(folder, port, use_key=True):
@@ -213,6 +272,16 @@ def start_server(folder, port, use_key=True):
     srv.folder = folder
     srv.key = secrets.token_hex(3) if use_key else ""
     srv.on_receive = None
+    srv.on_download = None
+    srv.outbox = {}  # name -> path of files offered to the other device
+    srv.lock = threading.Lock()
+    srv.staging = tempfile.mkdtemp(prefix="wifishare-")  # browser uploads from this computer
+    ips = {"127.0.0.1", "::1", local_ip()}
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    srv.host_ips = ips
     url = f"http://{local_ip()}:{port}/" + (f"?key={srv.key}" if srv.key else "")
     return srv, url
 
@@ -221,12 +290,14 @@ def serve(args):
     srv, url = start_server(args.dir, args.port, not args.no_key)
     print("\nWiFi Share is running.")
     print(f"  Open this on your other device (same Wi-Fi):\n\n    {url}\n")
-    print(f"  Received files are saved in: {srv.folder}")
+    print(f"  Files sent TO this computer are saved in: {srv.folder}")
     print("  Press Ctrl+C to stop.\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        cleanup(srv)
 
 
 def make_qr(text):
@@ -368,10 +439,9 @@ def make_qr(text):
 
 
 def gui():
-    """Desktop window: QR code for phones, live list of received files."""
+    """Desktop window: QR code for phones, send files, live list of received files."""
     import queue
     import subprocess
-    import threading
     import time
     import tkinter as tk
     import webbrowser
@@ -417,29 +487,54 @@ def gui():
         messagebox.showerror("WiFi Share", "Could not start: ports 8000-8010 are all in use.")
         return
     events = queue.Queue()
-    srv.on_receive = lambda name, size: events.put((name, size))
+    srv.on_receive = lambda name, size: events.put(("recv", name))
+    srv.on_download = lambda name: events.put(("sent", name))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    state = {"folder": folder}
 
     root.title("WiFi Share")
     root.configure(bg=BG)
-    root.geometry("420x780")
-    root.minsize(400, 740)
+    root.geometry("420x740")
+    root.minsize(400, 700)
+
+    def button(parent, text, cmd, primary=False):
+        bg, hov = (ACC, ACC_HOVER) if primary else (BTN, BTN_HOVER)
+        b = tk.Label(parent, text=text, font=(FONT, 10, "bold"), bg=bg, fg="#ffffff",
+                     padx=14, pady=10, cursor="hand2")
+        b.bind("<Button-1>", lambda e: cmd(b))
+        b.bind("<Enter>", lambda e: b.config(bg=hov))
+        b.bind("<Leave>", lambda e: b.config(bg=bg))
+        return b
+
+    def shorten(text, limit=30):
+        return text if len(text) <= limit else "\u2026" + text[-(limit - 1):]
+
+    def human(b):
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024 or unit == "GB":
+                return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+            b /= 1024
 
     head = tk.Frame(root, bg=BG)
-    head.pack(fill="x", padx=24, pady=(22, 0))
+    head.pack(fill="x", padx=24, pady=(18, 0))
     tk.Label(head, text="WiFi Share", font=(FONT, 20, "bold"), bg=BG, fg=FG).pack(side="left")
-    tk.Label(head, text="\u25cf Ready", font=(FONT, 10), bg=BG, fg=GREEN).pack(side="right")
+    status = tk.Label(head, text="\u25cf Ready", font=(FONT, 10), bg=BG, fg=GREEN)
+    status.pack(side="right")
     tk.Label(root, text="Send files between devices on the same Wi-Fi", font=(FONT, 10),
-             bg=BG, fg=DIM, anchor="w").pack(fill="x", padx=24, pady=(2, 16))
+             bg=BG, fg=DIM, anchor="w").pack(fill="x", padx=24, pady=(2, 12))
+
+    def flash(text):
+        status.config(text="\u25cf " + text, fg=ACC_HOVER)
+        root.after(4000, lambda: status.config(text="\u25cf Ready", fg=GREEN))
 
     card = tk.Frame(root, bg=CARD)
     card.pack(fill="x", padx=24)
     matrix = make_qr(url)
     n = len(matrix)
-    cell = max(4, 240 // (n + 8))
+    cell = max(4, 200 // (n + 8))
     side = (n + 8) * cell
     cv = tk.Canvas(card, width=side, height=side, bg=CARD, highlightthickness=0)
-    cv.pack(pady=(18, 10))
+    cv.pack(pady=(14, 8))
     r = 18
     pts = [r, 0, side - r, 0, side, 0, side, r, side, side - r, side, side, side - r, side,
            r, side, 0, side, 0, side - r, 0, r, 0, 0]
@@ -451,30 +546,24 @@ def gui():
                                     fill="#0e1116", outline="")
     tk.Label(card, text="Scan with your phone's camera", font=(FONT, 12, "bold"),
              bg=CARD, fg=FG).pack()
-    tk.Label(card, text="or type this link into the browser:", font=(FONT, 9),
-             bg=CARD, fg=DIM).pack(pady=(2, 4))
-    tk.Label(card, text=url, font=("Consolas", 10), bg=CARD, fg=ACC_HOVER,
-             wraplength=340).pack(padx=12, pady=(0, 16))
+    tk.Label(card, text=url, font=("Consolas", 9), bg=CARD, fg=ACC_HOVER,
+             wraplength=340).pack(padx=12, pady=(2, 12))
 
-    def button(parent, text, cmd, primary=False):
-        bg, hov = (ACC, ACC_HOVER) if primary else (BTN, BTN_HOVER)
-        b = tk.Label(parent, text=text, font=(FONT, 10, "bold"), bg=bg, fg="#ffffff",
-                     padx=14, pady=10, cursor="hand2")
-        b.bind("<Button-1>", lambda e: cmd(b))
-        b.bind("<Enter>", lambda e: b.config(bg=hov))
-        b.bind("<Leave>", lambda e: b.config(bg=bg))
-        return b
+    def send_files(_):
+        paths = filedialog.askopenfilenames(title="Choose files to send to the other device")
+        added = [share(srv, p) for p in paths if os.path.isfile(p)]
+        if added:
+            show_tab("send")
+            flash(f"Ready to send {len(added)} file{'s' if len(added) != 1 else ''}")
+
+    button(root, "Send files to the other device\u2026", send_files, primary=True).pack(
+        fill="x", padx=24, pady=(12, 0))
 
     def copy(b):
         root.clipboard_clear()
         root.clipboard_append(url)
         b.config(text="Copied \u2713")
         root.after(1200, lambda: b.config(text="Copy link"))
-
-    state = {"folder": folder}
-
-    def shorten(path, limit=42):
-        return path if len(path) <= limit else "\u2026" + path[-(limit - 1):]
 
     def open_folder(_):
         path = os.path.normpath(state["folder"])
@@ -499,7 +588,7 @@ def gui():
             messagebox.showerror("WiFi Share", f"Can't save files to:\n{path}\n\nPick another folder.")
             return
         state["folder"] = srv.folder = path
-        path_label.config(text=shorten(path))
+        path_label.config(text=shorten(path, 28))
         save_cfg({} if path == default_dir else {"folder": path})
 
     def choose_folder(_):
@@ -509,65 +598,115 @@ def gui():
             set_folder(new)
 
     btns = tk.Frame(root, bg=BG)
-    btns.pack(fill="x", padx=24, pady=14)
-    for i, (t, c, p) in enumerate([("Copy link", copy, True),
-                                   ("Open in browser", lambda _: webbrowser.open(url), False),
-                                   ("Open folder", open_folder, False)]):
+    btns.pack(fill="x", padx=24, pady=10)
+    for i, (t, c) in enumerate([("Copy link", copy),
+                                ("Open in browser", lambda _: webbrowser.open(url)),
+                                ("Open folder", open_folder)]):
         btns.columnconfigure(i, weight=1, uniform="b")
-        button(btns, t, c, p).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+        button(btns, t, c).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
 
     loc = tk.Frame(root, bg=CARD)
-    loc.pack(fill="x", padx=24, pady=(0, 16))
-    tk.Label(loc, text="Save received files to", font=(FONT, 9), bg=CARD, fg=DIM,
-             anchor="w").pack(fill="x", padx=14, pady=(12, 0))
-    path_label = tk.Label(loc, text=shorten(folder), font=("Consolas", 10), bg=CARD, fg=FG, anchor="w")
-    path_label.pack(fill="x", padx=14, pady=(2, 8))
-    loc_btns = tk.Frame(loc, bg=CARD)
-    loc_btns.pack(fill="x", padx=14, pady=(0, 14))
-    button(loc_btns, "Change\u2026", choose_folder).pack(side="left")
-    button(loc_btns, "Reset to default", lambda _: set_folder(default_dir)).pack(side="left", padx=(8, 0))
+    loc.pack(fill="x", padx=24)
+    tk.Label(loc, text="Save to", font=(FONT, 9), bg=CARD, fg=DIM).pack(side="left", padx=(14, 6), pady=12)
+    reset = tk.Label(loc, text="Reset", font=(FONT, 9, "underline"), bg=CARD, fg=DIM, cursor="hand2")
+    reset.pack(side="right", padx=(0, 14))
+    reset.bind("<Button-1>", lambda e: set_folder(default_dir))
+    change = button(loc, "Change\u2026", choose_folder)
+    change.config(pady=5)
+    change.pack(side="right", padx=(0, 10), pady=8)
+    path_label = tk.Label(loc, text=shorten(folder, 28), font=("Consolas", 9), bg=CARD, fg=FG, anchor="w")
+    path_label.pack(side="left", fill="x", expand=True)
 
-    tk.Label(root, text="Received", font=(FONT, 12, "bold"), bg=BG, fg=FG,
-             anchor="w").pack(fill="x", padx=24)
-    feed = tk.Frame(root, bg=BG)
-    feed.pack(fill="both", expand=True, padx=24, pady=(6, 16))
-    empty = tk.Label(feed, text="Waiting for files\u2026", font=(FONT, 10), bg=BG, fg=DIM, anchor="w")
+    tabs = tk.Frame(root, bg=BG)
+    tabs.pack(fill="x", padx=24, pady=(14, 4))
+    tab_recv = tk.Label(tabs, text="Received", font=(FONT, 12, "bold"), bg=BG, cursor="hand2")
+    tab_send = tk.Label(tabs, text="To send", font=(FONT, 12, "bold"), bg=BG, cursor="hand2")
+    tab_recv.pack(side="left", padx=(0, 18))
+    tab_send.pack(side="left")
+    body = tk.Frame(root, bg=BG)
+    body.pack(fill="both", expand=True, padx=24, pady=(0, 14))
+    feed = tk.Frame(body, bg=BG)
+    outfeed = tk.Frame(body, bg=BG)
+
+    def show_tab(which):
+        feed.pack_forget()
+        outfeed.pack_forget()
+        (feed if which == "recv" else outfeed).pack(fill="both", expand=True)
+        tab_recv.config(fg=FG if which == "recv" else DIM)
+        tab_send.config(fg=FG if which == "send" else DIM)
+
+    tab_recv.bind("<Button-1>", lambda e: show_tab("recv"))
+    tab_send.bind("<Button-1>", lambda e: show_tab("send"))
+
+    empty = tk.Label(feed, text="Files the other device sends will show up here.",
+                     font=(FONT, 10), bg=BG, fg=DIM, anchor="w")
     empty.pack(fill="x")
     rows = []
 
-    def human(b):
-        for unit in ("B", "KB", "MB", "GB"):
-            if b < 1024 or unit == "GB":
-                return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
-            b /= 1024
-
-    def add_row(name, size):
+    def add_row(name):
         empty.pack_forget()
         row = tk.Frame(feed, bg=CARD)
-        short = name if len(name) <= 30 else name[:27] + "\u2026"
-        tk.Label(row, text=short, font=(FONT, 10), bg=CARD, fg=FG, anchor="w").pack(
+        tk.Label(row, text=shorten(name, 34), font=(FONT, 10), bg=CARD, fg=FG, anchor="w").pack(
             side="left", padx=12, pady=9)
-        tk.Label(row, text=f"{human(size)}  \u00b7  {time.strftime('%H:%M')}", font=(FONT, 9),
+        try:
+            size = human(os.path.getsize(os.path.join(state["folder"], name)))
+        except OSError:
+            size = ""
+        tk.Label(row, text=f"{size}  \u00b7  {time.strftime('%H:%M')}", font=(FONT, 9),
                  bg=CARD, fg=DIM).pack(side="right", padx=12)
         if rows:
             row.pack(fill="x", pady=3, before=rows[0])
         else:
             row.pack(fill="x", pady=3)
         rows.insert(0, row)
-        while len(rows) > 6:
+        while len(rows) > 5:
             rows.pop().destroy()
+
+    last = {"out": None}
+
+    def refresh_outbox():
+        snap = tuple(srv.outbox.items())
+        if snap == last["out"]:
+            return
+        last["out"] = snap
+        for w in outfeed.winfo_children():
+            w.destroy()
+        if not snap:
+            tk.Label(outfeed, text="Nothing queued. Use \"Send files\u2026\" above.",
+                     font=(FONT, 10), bg=BG, fg=DIM, anchor="w").pack(fill="x")
+        for name, path in reversed(snap[-5:]):
+            row = tk.Frame(outfeed, bg=CARD)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=shorten(name, 30), font=(FONT, 10), bg=CARD, fg=FG, anchor="w").pack(
+                side="left", padx=12, pady=9)
+            x = tk.Label(row, text="\u2715", font=(FONT, 10), bg=CARD, fg=DIM, cursor="hand2")
+            x.pack(side="right", padx=12)
+            x.bind("<Button-1>", lambda e, nm=name: unshare(srv, nm))
+            try:
+                size = human(os.path.getsize(path))
+            except OSError:
+                size = "missing"
+            tk.Label(row, text=size, font=(FONT, 9), bg=CARD, fg=DIM).pack(side="right")
 
     def poll():
         try:
             while True:
-                add_row(*events.get_nowait())
+                kind, name = events.get_nowait()
+                if kind == "recv":
+                    add_row(name)
+                    flash(f"Received {shorten(name, 22)}")
+                else:
+                    flash(f"Sent {shorten(name, 22)}")
         except queue.Empty:
             pass
+        refresh_outbox()
         root.after(300, poll)
 
+    show_tab("recv")
     poll()
     root.mainloop()
     srv.shutdown()
+    cleanup(srv)
 
 
 def send(args):
