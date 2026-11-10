@@ -26,15 +26,18 @@ if sys.stdout is None:  # windowed .exe has no console
 
 PAGE = b"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="WiFi Share">
 <title>WiFi Share</title>
 <style>
-:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d5d9de;--acc:#2563eb}
+:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d5d9de;--acc:#3b7bf6}
 @media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8eaed;--card:#1f2226;--line:#383c42;--acc:#6ea0ff}}
 body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-main{max-width:640px;margin:0 auto;padding:20px}
+main{max-width:640px;margin:0 auto;padding:20px;padding-top:max(20px,env(safe-area-inset-top))}
 h1{font-size:1.4rem}h2{font-size:1rem;margin-top:28px}
-#drop{border:2px dashed var(--line);border-radius:12px;padding:36px 16px;text-align:center;background:var(--card);cursor:pointer}
+#drop{border:2px dashed var(--line);border-radius:12px;padding:56px 16px;text-align:center;background:var(--card);cursor:pointer}
 #drop.over{border-color:var(--acc)}
 .row{display:flex;gap:10px;align-items:center;justify-content:space-between;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0}
 .row span{overflow-wrap:anywhere}small{opacity:.65}
@@ -198,6 +201,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 os.remove(part)
             return self._reply(500, b"Upload failed", close=True)
         print(f"  received  {os.path.basename(path)}  ({length:,} bytes)")
+        if self.server.on_receive:
+            self.server.on_receive(os.path.basename(path), length)
         self._reply(200, json.dumps({"saved": os.path.basename(path)}).encode(), "application/json")
 
 
@@ -206,7 +211,8 @@ def start_server(folder, port, use_key=True):
     os.makedirs(folder, exist_ok=True)
     srv = Server(("0.0.0.0", port), Handler)
     srv.folder = folder
-    srv.key = secrets.token_urlsafe(6) if use_key else ""
+    srv.key = secrets.token_hex(3) if use_key else ""
+    srv.on_receive = None
     url = f"http://{local_ip()}:{port}/" + (f"?key={srv.key}" if srv.key else "")
     return srv, url
 
@@ -223,15 +229,165 @@ def serve(args):
         print("\nStopped.")
 
 
+def make_qr(text):
+    """Tiny QR encoder (byte mode, error correction L, versions 1-5). Returns a bool matrix."""
+    data = text.encode()
+    caps = {1: (19, 7), 2: (34, 10), 3: (55, 15), 4: (80, 20), 5: (108, 26)}
+    ver = next((v for v, (d, _) in caps.items() if len(data) + 2 <= d), None)
+    if ver is None:
+        raise ValueError("text too long for QR")
+    nd, ne = caps[ver]
+    bits = "0100" + format(len(data), "08b") + "".join(format(b, "08b") for b in data)
+    bits += "0" * min(4, nd * 8 - len(bits))
+    bits += "0" * (-len(bits) % 8)
+    pad = 0
+    while len(bits) < nd * 8:
+        bits += format((0xEC, 0x11)[pad % 2], "08b")
+        pad += 1
+    cw = [int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)]
+    # Reed-Solomon error correction over GF(256)
+    exp, log, x = [0] * 512, [0] * 256, 1
+    for i in range(255):
+        exp[i], log[x] = x, i
+        x <<= 1
+        if x & 256:
+            x ^= 0x11D
+    for i in range(255, 512):
+        exp[i] = exp[i - 255]
+    mul = lambda a, b: 0 if a == 0 or b == 0 else exp[log[a] + log[b]]
+    gen = [1]
+    for i in range(ne):
+        nxt = [0] * (len(gen) + 1)
+        for j, c in enumerate(gen):
+            nxt[j] ^= c
+            nxt[j + 1] ^= mul(c, exp[i])
+        gen = nxt
+    rem = [0] * ne
+    for b in cw:
+        f = b ^ rem[0]
+        rem = rem[1:] + [0]
+        for i in range(ne):
+            rem[i] ^= mul(gen[i + 1], f)
+    stream = "".join(format(b, "08b") for b in cw + rem)
+
+    size = 17 + 4 * ver
+    mod = [[False] * size for _ in range(size)]
+    fn = [[False] * size for _ in range(size)]
+
+    def put(x, y, dark, m=None):
+        if 0 <= x < size and 0 <= y < size:
+            (mod if m is None else m)[y][x] = dark
+            fn[y][x] = True
+
+    for i in range(size):
+        put(6, i, i % 2 == 0)
+        put(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                put(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    if ver > 1:
+        c = size - 7
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                put(c + dx, c + dy, max(abs(dx), abs(dy)) != 1)
+
+    def fmt(mask, m=None):
+        d = (1 << 3) | mask  # error correction level L = 01
+        r = d
+        for _ in range(10):
+            r = (r << 1) ^ ((r >> 9) * 0x537)
+        b = (d << 10 | r) ^ 0x5412
+        g = lambda i: (b >> i) & 1 == 1
+        for i in range(6):
+            put(8, i, g(i), m)
+        put(8, 7, g(6), m)
+        put(8, 8, g(7), m)
+        put(7, 8, g(8), m)
+        for i in range(9, 15):
+            put(14 - i, 8, g(i), m)
+        for i in range(8):
+            put(size - 1 - i, 8, g(i), m)
+        for i in range(8, 15):
+            put(8, size - 15 + i, g(i), m)
+        put(8, size - 8, True, m)
+
+    fmt(0)  # reserve the format areas
+    k = 0
+    for right in range(size - 1, 0, -2):
+        if right <= 6:  # skip the vertical timing column
+            right -= 1
+        for vert in range(size):
+            for j in range(2):
+                xx = right - j
+                yy = size - 1 - vert if ((right + 1) & 2) == 0 else vert
+                if not fn[yy][xx] and k < len(stream):
+                    mod[yy][xx] = stream[k] == "1"
+                    k += 1
+
+    cond = [lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0,
+            lambda x, y: x % 3 == 0, lambda x, y: (x + y) % 3 == 0,
+            lambda x, y: (x // 3 + y // 2) % 2 == 0,
+            lambda x, y: x * y % 2 + x * y % 3 == 0,
+            lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+            lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0]
+
+    def penalty(m):
+        p = 0
+        lines = ["".join("1" if v else "0" for v in row) for row in m]
+        lines += ["".join("1" if m[y][x] else "0" for y in range(size)) for x in range(size)]
+        for s in lines:
+            run = 1
+            for i in range(1, size):
+                if s[i] == s[i - 1]:
+                    run += 1
+                else:
+                    p += run - 2 if run >= 5 else 0
+                    run = 1
+            p += run - 2 if run >= 5 else 0
+            p += 40 * (s.count("10111010000") + s.count("00001011101"))
+        for y in range(size - 1):
+            for x in range(size - 1):
+                if m[y][x] == m[y][x + 1] == m[y + 1][x] == m[y + 1][x + 1]:
+                    p += 3
+        dark, tot = sum(map(sum, m)), size * size
+        return p + 10 * (-(-abs(dark * 20 - tot * 10) // tot) - 1)
+
+    best, best_p = None, None
+    for mask in range(8):
+        m = [row[:] for row in mod]
+        for y in range(size):
+            for x in range(size):
+                if not fn[y][x] and cond[mask](x, y):
+                    m[y][x] = not m[y][x]
+        fmt(mask, m)
+        p = penalty(m)
+        if best_p is None or p < best_p:
+            best, best_p = m, p
+    return best
+
+
 def gui():
-    """Small desktop window: double-click the .exe and go."""
+    """Desktop window: QR code for phones, live list of received files."""
+    import queue
     import threading
+    import time
     import tkinter as tk
     import webbrowser
     from tkinter import messagebox
 
+    try:  # crisp text on high-DPI Windows screens
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    BG, CARD, FG, DIM = "#0e1116", "#171b22", "#e8ecf2", "#8a94a6"
+    ACC, ACC_HOVER, BTN, BTN_HOVER, GREEN = "#3b7bf6", "#5a92ff", "#262c36", "#323a47", "#3ddc84"
+    FONT = "Segoe UI"
+
     folder = os.path.join(os.path.expanduser("~"), "Downloads", "WiFiShare")
-    srv = None
+    srv = url = None
     for port in range(8000, 8011):
         try:
             srv, url = start_server(folder, port)
@@ -239,33 +395,114 @@ def gui():
         except OSError:
             continue
     root = tk.Tk()
-    root.title("WiFi Share")
-    root.geometry("460x250")
     if srv is None:
         messagebox.showerror("WiFi Share", "Could not start: ports 8000-8010 are all in use.")
         return
+    events = queue.Queue()
+    srv.on_receive = lambda name, size: events.put((name, size))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-    pad = {"padx": 16, "pady": 4}
-    tk.Label(root, text="WiFi Share", font=("Segoe UI", 16, "bold")).pack(pady=(14, 2))
-    tk.Label(root, text="On your other device (same Wi-Fi), open this link:").pack(**pad)
-    box = tk.Entry(root, justify="center")
-    box.insert(0, url)
-    box.config(state="readonly")
-    box.pack(fill="x", **pad)
+    root.title("WiFi Share")
+    root.configure(bg=BG)
+    root.geometry("420x700")
+    root.minsize(400, 660)
 
-    def copy():
+    head = tk.Frame(root, bg=BG)
+    head.pack(fill="x", padx=24, pady=(22, 0))
+    tk.Label(head, text="WiFi Share", font=(FONT, 20, "bold"), bg=BG, fg=FG).pack(side="left")
+    tk.Label(head, text="\u25cf Ready", font=(FONT, 10), bg=BG, fg=GREEN).pack(side="right")
+    tk.Label(root, text="Send files between devices on the same Wi-Fi", font=(FONT, 10),
+             bg=BG, fg=DIM, anchor="w").pack(fill="x", padx=24, pady=(2, 16))
+
+    card = tk.Frame(root, bg=CARD)
+    card.pack(fill="x", padx=24)
+    matrix = make_qr(url)
+    n = len(matrix)
+    cell = max(4, 240 // (n + 8))
+    side = (n + 8) * cell
+    cv = tk.Canvas(card, width=side, height=side, bg=CARD, highlightthickness=0)
+    cv.pack(pady=(18, 10))
+    r = 18
+    pts = [r, 0, side - r, 0, side, 0, side, r, side, side - r, side, side, side - r, side,
+           r, side, 0, side, 0, side - r, 0, r, 0, 0]
+    cv.create_polygon(pts, smooth=True, fill="#ffffff", outline="")
+    for y, row in enumerate(matrix):
+        for x, dark in enumerate(row):
+            if dark:
+                cv.create_rectangle((x + 4) * cell, (y + 4) * cell, (x + 5) * cell, (y + 5) * cell,
+                                    fill="#0e1116", outline="")
+    tk.Label(card, text="Scan with your phone's camera", font=(FONT, 12, "bold"),
+             bg=CARD, fg=FG).pack()
+    tk.Label(card, text="or type this link into the browser:", font=(FONT, 9),
+             bg=CARD, fg=DIM).pack(pady=(2, 4))
+    tk.Label(card, text=url, font=("Consolas", 10), bg=CARD, fg=ACC_HOVER,
+             wraplength=340).pack(padx=12, pady=(0, 16))
+
+    def button(parent, text, cmd, primary=False):
+        bg, hov = (ACC, ACC_HOVER) if primary else (BTN, BTN_HOVER)
+        b = tk.Label(parent, text=text, font=(FONT, 10, "bold"), bg=bg, fg="#ffffff",
+                     pady=10, cursor="hand2")
+        b.bind("<Button-1>", lambda e: cmd(b))
+        b.bind("<Enter>", lambda e: b.config(bg=hov))
+        b.bind("<Leave>", lambda e: b.config(bg=bg))
+        return b
+
+    def copy(b):
         root.clipboard_clear()
         root.clipboard_append(url)
+        b.config(text="Copied \u2713")
+        root.after(1200, lambda: b.config(text="Copy link"))
 
-    row = tk.Frame(root)
-    row.pack(pady=8)
-    tk.Button(row, text="Copy link", command=copy).pack(side="left", padx=4)
-    tk.Button(row, text="Open in browser", command=lambda: webbrowser.open(url)).pack(side="left", padx=4)
-    tk.Button(row, text="Open received files",
-              command=lambda: os.startfile(folder) if hasattr(os, "startfile") else webbrowser.open(folder)
-              ).pack(side="left", padx=4)
-    tk.Label(root, text=f"Received files go to:\n{folder}", fg="gray").pack(**pad)
+    def open_folder(_):
+        os.startfile(folder) if hasattr(os, "startfile") else webbrowser.open("file://" + folder)
+
+    btns = tk.Frame(root, bg=BG)
+    btns.pack(fill="x", padx=24, pady=14)
+    for i, (t, c, p) in enumerate([("Copy link", copy, True),
+                                   ("Open in browser", lambda _: webbrowser.open(url), False),
+                                   ("Open folder", open_folder, False)]):
+        btns.columnconfigure(i, weight=1, uniform="b")
+        button(btns, t, c, p).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+
+    tk.Label(root, text="Received", font=(FONT, 12, "bold"), bg=BG, fg=FG,
+             anchor="w").pack(fill="x", padx=24)
+    feed = tk.Frame(root, bg=BG)
+    feed.pack(fill="both", expand=True, padx=24, pady=(6, 16))
+    empty = tk.Label(feed, text="Waiting for files\u2026", font=(FONT, 10), bg=BG, fg=DIM, anchor="w")
+    empty.pack(fill="x")
+    rows = []
+
+    def human(b):
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024 or unit == "GB":
+                return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+            b /= 1024
+
+    def add_row(name, size):
+        empty.pack_forget()
+        row = tk.Frame(feed, bg=CARD)
+        short = name if len(name) <= 30 else name[:27] + "\u2026"
+        tk.Label(row, text=short, font=(FONT, 10), bg=CARD, fg=FG, anchor="w").pack(
+            side="left", padx=12, pady=9)
+        tk.Label(row, text=f"{human(size)}  \u00b7  {time.strftime('%H:%M')}", font=(FONT, 9),
+                 bg=CARD, fg=DIM).pack(side="right", padx=12)
+        if rows:
+            row.pack(fill="x", pady=3, before=rows[0])
+        else:
+            row.pack(fill="x", pady=3)
+        rows.insert(0, row)
+        while len(rows) > 6:
+            rows.pop().destroy()
+
+    def poll():
+        try:
+            while True:
+                add_row(*events.get_nowait())
+        except queue.Empty:
+            pass
+        root.after(300, poll)
+
+    poll()
     root.mainloop()
     srv.shutdown()
 
