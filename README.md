@@ -8,14 +8,6 @@ Run it on one device. It prints a URL. Open that URL on the other device (a phon
 ## Download (Windows)
 Grab `WiFiShare.exe` from the [Releases](../../releases) page (built automatically by GitHub Actions) and double-click it. A small window shows a link; open it on your other device. Windows will ask about the firewall the first time: click Allow on private networks.
 
-## Releasing a new version
-Push to `main` and download the exe from the Actions run's artifacts, or tag a release:
-```
-git tag v1.0.0
-git push origin v1.0.0
-```
-GitHub builds the exe and attaches it to the release.
-
 ## Usage from Python
 ```
 python wifishare.py                      # open the app window
