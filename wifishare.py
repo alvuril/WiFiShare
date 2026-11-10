@@ -370,11 +370,12 @@ def make_qr(text):
 def gui():
     """Desktop window: QR code for phones, live list of received files."""
     import queue
+    import subprocess
     import threading
     import time
     import tkinter as tk
     import webbrowser
-    from tkinter import messagebox
+    from tkinter import filedialog, messagebox
 
     try:  # crisp text on high-DPI Windows screens
         import ctypes
@@ -386,7 +387,24 @@ def gui():
     ACC, ACC_HOVER, BTN, BTN_HOVER, GREEN = "#3b7bf6", "#5a92ff", "#262c36", "#323a47", "#3ddc84"
     FONT = "Segoe UI"
 
-    folder = os.path.join(os.path.expanduser("~"), "Downloads", "WiFiShare")
+    default_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), "Downloads", "WiFiShare"))
+    cfg_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "WiFiShare")
+    cfg_path = os.path.join(cfg_dir, "config.json")
+
+    def save_cfg(data):
+        try:
+            os.makedirs(cfg_dir, exist_ok=True)
+            with open(cfg_path, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+
+    try:
+        with open(cfg_path) as f:
+            saved = json.load(f).get("folder")
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    folder = os.path.normpath(saved) if saved and os.path.isdir(saved) else default_dir
     srv = url = None
     for port in range(8000, 8011):
         try:
@@ -404,8 +422,8 @@ def gui():
 
     root.title("WiFi Share")
     root.configure(bg=BG)
-    root.geometry("420x700")
-    root.minsize(400, 660)
+    root.geometry("420x780")
+    root.minsize(400, 740)
 
     head = tk.Frame(root, bg=BG)
     head.pack(fill="x", padx=24, pady=(22, 0))
@@ -441,7 +459,7 @@ def gui():
     def button(parent, text, cmd, primary=False):
         bg, hov = (ACC, ACC_HOVER) if primary else (BTN, BTN_HOVER)
         b = tk.Label(parent, text=text, font=(FONT, 10, "bold"), bg=bg, fg="#ffffff",
-                     pady=10, cursor="hand2")
+                     padx=14, pady=10, cursor="hand2")
         b.bind("<Button-1>", lambda e: cmd(b))
         b.bind("<Enter>", lambda e: b.config(bg=hov))
         b.bind("<Leave>", lambda e: b.config(bg=bg))
@@ -453,8 +471,42 @@ def gui():
         b.config(text="Copied \u2713")
         root.after(1200, lambda: b.config(text="Copy link"))
 
+    state = {"folder": folder}
+
+    def shorten(path, limit=42):
+        return path if len(path) <= limit else "\u2026" + path[-(limit - 1):]
+
     def open_folder(_):
-        os.startfile(folder) if hasattr(os, "startfile") else webbrowser.open("file://" + folder)
+        path = os.path.normpath(state["folder"])
+        os.makedirs(path, exist_ok=True)
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", path])  # opens the folder in File Explorer
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError:
+            messagebox.showinfo("WiFi Share", f"Received files are saved in:\n{path}")
+
+    def set_folder(path):
+        path = os.path.normpath(path)
+        try:
+            os.makedirs(path, exist_ok=True)
+            if not os.access(path, os.W_OK):
+                raise OSError("not writable")
+        except OSError:
+            messagebox.showerror("WiFi Share", f"Can't save files to:\n{path}\n\nPick another folder.")
+            return
+        state["folder"] = srv.folder = path
+        path_label.config(text=shorten(path))
+        save_cfg({} if path == default_dir else {"folder": path})
+
+    def choose_folder(_):
+        new = filedialog.askdirectory(title="Choose where received files are saved",
+                                      initialdir=state["folder"])
+        if new:
+            set_folder(new)
 
     btns = tk.Frame(root, bg=BG)
     btns.pack(fill="x", padx=24, pady=14)
@@ -463,6 +515,17 @@ def gui():
                                    ("Open folder", open_folder, False)]):
         btns.columnconfigure(i, weight=1, uniform="b")
         button(btns, t, c, p).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+
+    loc = tk.Frame(root, bg=CARD)
+    loc.pack(fill="x", padx=24, pady=(0, 16))
+    tk.Label(loc, text="Save received files to", font=(FONT, 9), bg=CARD, fg=DIM,
+             anchor="w").pack(fill="x", padx=14, pady=(12, 0))
+    path_label = tk.Label(loc, text=shorten(folder), font=("Consolas", 10), bg=CARD, fg=FG, anchor="w")
+    path_label.pack(fill="x", padx=14, pady=(2, 8))
+    loc_btns = tk.Frame(loc, bg=CARD)
+    loc_btns.pack(fill="x", padx=14, pady=(0, 14))
+    button(loc_btns, "Change\u2026", choose_folder).pack(side="left")
+    button(loc_btns, "Reset to default", lambda _: set_folder(default_dir)).pack(side="left", padx=(8, 0))
 
     tk.Label(root, text="Received", font=(FONT, 12, "bold"), bg=BG, fg=FG,
              anchor="w").pack(fill="x", padx=24)
