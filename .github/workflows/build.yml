@@ -21,13 +21,23 @@ jobs:
         run: pip install pyinstaller
       - name: Build exe
         run: pyinstaller --onefile --windowed --name WiFiShare wifishare.py
+      - name: Create SHA-256 checksum
+        run: |
+          $hash = (Get-FileHash dist\WiFiShare.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path dist\WiFiShare.exe.sha256 -Value "$hash  WiFiShare.exe" -Encoding ascii
+          "SHA-256: $hash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host "SHA-256: $hash"
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: WiFiShare-windows
-          path: dist/WiFiShare.exe
+          path: |
+            dist/WiFiShare.exe
+            dist/WiFiShare.exe.sha256
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/WiFiShare.exe
+          files: |
+            dist/WiFiShare.exe
+            dist/WiFiShare.exe.sha256
