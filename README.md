@@ -13,6 +13,13 @@ Run it on both devices to send in both directions app to app.
 ## Download (Windows)
 Grab `WiFiShare.exe` from the [Releases](../../releases) page (built automatically by GitHub Actions) and double-click it. A window shows a QR code and a link. On your phone, point the camera at the QR code and tap the banner that appears (iPhone and Android both work), or type the link by hand. Received files are listed live in the window and saved to `Downloads\WiFiShare`. Windows will ask about the firewall the first time: click Allow on private networks.
 
+## Verify your download
+Each release includes `WiFiShare.exe.sha256`, a fingerprint of the exe. To check that your download is untouched, run this in PowerShell in the folder with the exe and compare the result to the text in that file:
+```
+Get-FileHash .\WiFiShare.exe -Algorithm SHA256
+```
+If the two match (letter case doesn't matter), the file is the one GitHub built.
+
 ## Where files are saved
 Files sent *to* this computer go to `Downloads\WiFiShare`. Click **Change...** in the app window to pick another folder (it is remembered next time) or **Reset to default** to go back. Already-received files stay in the old folder.
 
